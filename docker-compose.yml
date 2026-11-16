@@ -1,0 +1,47 @@
+# Two API instances sharing one data volume (SQLite WAL coordinates them).
+# Swagger UI:  http://localhost:8001/docs  or  http://localhost:8002/docs
+# Reachable health checks: /health on each instance.
+services:
+  api-a:
+    build: .
+    image: track-merge:latest
+    environment:
+      DATA_ROOT: /data
+      INSTANCE_ID: api-a
+      GC_INTERVAL_SECONDS: "5"
+      MERGE_LEASE_SECONDS: "120"
+    ports:
+      - "8001:8000"
+    volumes:
+      - track-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api-b:
+    image: track-merge:latest
+    build: .
+    depends_on:
+      api-a:
+        condition: service_started
+    environment:
+      DATA_ROOT: /data
+      INSTANCE_ID: api-b
+      GC_INTERVAL_SECONDS: "5"
+      MERGE_LEASE_SECONDS: "120"
+    ports:
+      - "8002:8000"
+    volumes:
+      - track-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  track-data:
