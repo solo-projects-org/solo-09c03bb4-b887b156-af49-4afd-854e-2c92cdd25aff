@@ -1,6 +1,12 @@
 # Two API instances sharing one data volume (SQLite WAL coordinates them).
 # Swagger UI:  http://localhost:8001/docs  or  http://localhost:8002/docs
 # Reachable health checks: /health on each instance.
+#
+# Rolling restart safety: each process registers an incarnation lease in the
+# shared SQLite metadata and heartbeats it. Startup recovery and the GC loop
+# only reclaim temp files / unpublished fragments whose owning incarnation is
+# dead or lease-expired, so restarting one instance never interrupts the
+# other instance's in-flight uploads or merges.
 services:
   api-a:
     build: .
@@ -10,6 +16,10 @@ services:
       INSTANCE_ID: api-a
       GC_INTERVAL_SECONDS: "5"
       MERGE_LEASE_SECONDS: "120"
+      # Incarnation lease: renewed every 5s; a SIGKILLed instance becomes
+      # reclaimable 30s after its last heartbeat.
+      INSTANCE_LEASE_SECONDS: "30"
+      INSTANCE_HEARTBEAT_SECONDS: "5"
     ports:
       - "8001:8000"
     volumes:
@@ -32,6 +42,8 @@ services:
       INSTANCE_ID: api-b
       GC_INTERVAL_SECONDS: "5"
       MERGE_LEASE_SECONDS: "120"
+      INSTANCE_LEASE_SECONDS: "30"
+      INSTANCE_HEARTBEAT_SECONDS: "5"
     ports:
       - "8002:8000"
     volumes:

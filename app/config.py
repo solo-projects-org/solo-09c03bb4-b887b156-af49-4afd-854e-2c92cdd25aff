@@ -18,6 +18,11 @@ class Settings:
     data_root: Path
     merge_lease_seconds: int = 120
     heartbeat_interval_seconds: float = 5.0
+    # Instance incarnation lease. A process renews it on every heartbeat; if
+    # the process is SIGKILLed, its lease expires after this many seconds and
+    # other instances may then reclaim its temp files / orphan fragments.
+    instance_lease_seconds: int = 30
+    instance_heartbeat_seconds: float = 5.0
     pin_ttl_seconds: int = 30 * 60
     gc_interval_seconds: float = 10.0
     # A superseded file is only physically removed after this grace period
@@ -30,6 +35,9 @@ class Settings:
     merge_sleep_seconds: float = 0.0
     # Test-only slowdown between export fragments; 0 disables it.
     export_sleep_seconds: float = 0.0
+    # Test-only slowdown between the fragment rename and the metadata
+    # publish transaction; 0 disables it.
+    upload_sleep_seconds: float = 0.0
     instance_id: str = ""
 
     @property
@@ -55,6 +63,9 @@ def load_settings() -> Settings:
         data_root=data_root,
         merge_lease_seconds=_int_env("MERGE_LEASE_SECONDS", 120),
         heartbeat_interval_seconds=float(os.environ.get("HEARTBEAT_INTERVAL", "5")),
+        instance_lease_seconds=_int_env("INSTANCE_LEASE_SECONDS", 30),
+        instance_heartbeat_seconds=float(
+            os.environ.get("INSTANCE_HEARTBEAT_SECONDS", "5")),
         pin_ttl_seconds=_int_env("PIN_TTL_SECONDS", 30 * 60),
         gc_interval_seconds=float(os.environ.get("GC_INTERVAL_SECONDS", "10")),
         gc_grace_seconds=_int_env("GC_GRACE_SECONDS", 300),
@@ -63,6 +74,7 @@ def load_settings() -> Settings:
         parquet_batch_size=_int_env("PARQUET_BATCH_SIZE", 5_000),
         merge_sleep_seconds=float(os.environ.get("MERGE_SLEEP_SECONDS", "0")),
         export_sleep_seconds=float(os.environ.get("EXPORT_SLEEP_SECONDS", "0")),
+        upload_sleep_seconds=float(os.environ.get("UPLOAD_SLEEP_SECONDS", "0")),
         instance_id=os.environ.get("INSTANCE_ID", os.uname().nodename),
     )
 

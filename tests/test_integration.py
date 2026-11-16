@@ -44,6 +44,10 @@ class Server:
             "INSTANCE_ID": instance_id,
             "GC_INTERVAL_SECONDS": "2",
             "GC_GRACE_SECONDS": "1",
+            # Short incarnation lease so a SIGKILLed writer's remnants become
+            # reclaimable quickly while live peers keep renewing theirs.
+            "INSTANCE_LEASE_SECONDS": "3",
+            "INSTANCE_HEARTBEAT_SECONDS": "1",
             "PYTHONPATH": str(REPO_ROOT),
         })
         if env_extra:
@@ -130,6 +134,36 @@ def data_root(tmp_path: Path) -> Path:
     return root
 
 
+def _wait_until(condition, timeout: float = 15.0, interval: float = 0.3,
+                message: str = "condition not met in time"):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = condition()
+        if result:
+            return result
+        time.sleep(interval)
+    raise AssertionError(message)
+
+
+def _wait_gc_drained(data_root: Path, timeout: float = 15.0) -> None:
+    def drained():
+        db = sqlite3.connect(data_root / "metadata.db")
+        left = db.execute(
+            "SELECT COUNT(*) FROM gc_queue WHERE deleted=0").fetchone()[0]
+        db.close()
+        return left == 0
+    _wait_until(drained, timeout, message="gc_queue did not drain")
+
+
+def _wait_remnants_reaped(data_root: Path) -> None:
+    """Dead-owner tmp/orphan remnants disappear once the incarnation lease
+    expires and the reaper (startup or GC loop) claims them."""
+    def clean():
+        tmp_left = [p for p in (data_root / "tmp").rglob("*") if p.is_file()]
+        return not tmp_left
+    _wait_until(clean, message="dead-owner tmp remnants were not reaped")
+
+
 def _assert_voyage_intact(server: Server, voyage: str, specs):
     status, body = server.get(f"/voyages/{voyage}")
     assert status == 200, body
@@ -214,11 +248,13 @@ def test_crash_during_merge_then_restart(data_root, hook):
     finally:
         server.stop(kill=True)
 
-    # No tmp remnants and no orphan merged file should survive restart.
+    # No tmp remnants and no orphan merged file should survive restart once
+    # the crashed incarnation's lease expires and the reaper runs.
     server2 = Server(data_root, "recovered")
     server2.wait_ready()
     try:
         _assert_voyage_intact(server2, "v9", specs)
+        _wait_remnants_reaped(data_root)
         status, body = server2.get("/voyages/v9")
         if hook == "merge_after_commit":
             # The publish transaction had committed before the crash: the
@@ -226,10 +262,13 @@ def test_crash_during_merge_then_restart(data_root, hook):
             assert body["active_file_count"] == 1
             assert list((data_root / "merged").rglob("*.parquet"))
         else:
-            # Earlier crash points leave the original batches fully published.
+            # Earlier crash points leave the original batches fully published;
+            # the unpublished merged file is reaped with its write intent.
             assert body["active_file_count"] == 3
-            assert list((data_root / "merged").rglob("*.parquet")) == []
-        assert not list((data_root / "tmp").iterdir())
+            _wait_until(
+                lambda: not list((data_root / "merged").rglob("*.parquet")),
+                message="orphan merged file was not reaped")
+        assert not [p for p in (data_root / "tmp").rglob("*") if p.is_file()]
 
         # A fresh merge after recovery must succeed and preserve every row.
         code, body = server2.post("/voyages/v9/merge")
@@ -270,8 +309,13 @@ def test_crash_during_upload_commit_is_recovered(data_root):
     server2 = Server(data_root, "up-recovery")
     server2.wait_ready()
     try:
-        # Orphan removed; only the acknowledged batch is visible.
-        assert len(list((data_root / "fragments" / "vu").glob("*.parquet"))) == 1
+        # The landed-but-unregistered fragment is kept while the crashed
+        # incarnation's lease could theoretically still commit it, then
+        # reclaimed automatically once the lease expires (no restart needed).
+        _wait_until(
+            lambda: len(list(
+                (data_root / "fragments" / "vu").glob("*.parquet"))) == 1,
+            message="orphan fragment was not reaped after lease expiry")
         status, body = server2.get("/voyages/vu")
         assert status == 200
         assert body["total_row_count"] == 90

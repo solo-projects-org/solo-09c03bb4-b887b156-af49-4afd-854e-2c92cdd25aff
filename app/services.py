@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Tuple
 
-from . import storage
+from . import recovery, storage
 from .config import Settings, settings as default_settings
 from .crashhooks import crash_if
 from .db import connect, transaction
@@ -57,13 +57,8 @@ def validate_voyage_id(voyage_id: str) -> None:
 
 
 def _expire_writing_merges(conn, now_iso: str) -> int:
-    """Mark writing merges whose lease has expired as failed. Returns count."""
-    cur = conn.execute(
-        "UPDATE merges SET state='failed', finished_at=? "
-        "WHERE state='writing' AND lease_expires <= ?",
-        (now_iso, now_iso),
-    )
-    return cur.rowcount
+    """Fail writing merges whose owner is dead / lease-expired. Returns count."""
+    return recovery.expire_writing_merges(conn, now_iso)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,40 +66,67 @@ def _expire_writing_merges(conn, now_iso: str) -> int:
 # --------------------------------------------------------------------------- #
 
 def startup_recovery(cfg: Settings = default_settings) -> dict:
-    """Clean up remnants of crashed processes. Safe to run on every instance."""
-    result = {"tmp_files_removed": 0, "orphan_files_removed": 0,
-              "writing_merges_failed": 0, "gc_entries_completed": 0}
+    """Reclaim remnants of crashed processes without disturbing live peers.
 
-    # 1. Every file in tmp/ is by definition an unpublished remnant.
-    if cfg.tmp_dir.exists():
-        for entry in cfg.tmp_dir.iterdir():
+    Safe to run on every instance during a rolling restart:
+    * this incarnation registers (and supersedes a stale row with the same
+      INSTANCE_ID) before anything is deleted;
+    * only files whose owning incarnation is dead or whose lease has expired
+      are reclaimed -- another instance's in-flight uploads/merges keep their
+      temp files, their write intents and their merge lease;
+    * fragments already renamed to their final path but not yet registered are
+      retained while their owner might still commit them, and reclaimed
+      automatically once that owner's lease expires;
+    * the orphan sweep re-checks each file inside a write transaction, so a
+      fragment published interleaved with the scan is never deleted.
+    """
+    # Registering first makes the reaper skip *our* fresh tmp directory while
+    # still reclaiming every previous incarnation of this instance id.
+    recovery.ensure_instance(cfg)
+
+    # Leftovers inside our own tmp dir can only belong to a previous boot that
+    # never reached registration; it is never a live peer's working directory.
+    own_tmp = cfg.data_root / recovery.incarnation_tmp_rel(cfg)
+    own_tmp_removed = 0
+    if own_tmp.exists():
+        for entry in own_tmp.iterdir():
             if entry.is_file():
                 entry.unlink(missing_ok=True)
-                result["tmp_files_removed"] += 1
+                own_tmp_removed += 1
+
+    reaped = recovery.reap_remnants(cfg)
+
+    result = {"tmp_files_removed": own_tmp_removed
+              + reaped["files_removed"] + reaped["legacy_tmp_removed"],
+              "orphan_files_removed": 0,
+              "writing_merges_failed": 0,
+              "gc_entries_completed": 0}
+    result.update({f"reaped_{k}": v for k, v in reaped.items()})
 
     conn = connect()
     try:
         with transaction(conn):
             now = _iso(datetime.now(timezone.utc))
-            cur = conn.execute(
-                "UPDATE merges SET state='failed', finished_at=? "
-                "WHERE state='writing'", (now,))
-            result["writing_merges_failed"] = cur.rowcount
+            result["writing_merges_failed"] = _expire_writing_merges(conn, now)
 
-            known = {r["rel_path"] for r in conn.execute(
-                "SELECT rel_path FROM fragments")}
-
-        # 2. Orphan files: on disk but never published (crash between rename
-        #    and metadata commit). Scan outside the write transaction.
+        # Orphan sweep (backstop): files on disk that are neither registered
+        # fragments nor active write targets. Each candidate is re-checked
+        # inside an IMMEDIATE transaction, so a fragment another instance
+        # publishes between scan and delete survives.
         for directory in (cfg.fragments_dir, cfg.merged_dir):
-            for path in directory.rglob("*.parquet"):
+            if not directory.exists():
+                continue
+            for path in list(directory.rglob("*.parquet")):
                 rel = str(path.relative_to(cfg.data_root))
-                if rel not in known:
+                with transaction(conn):
+                    if recovery.is_published_or_intended(conn, rel):
+                        continue
                     path.unlink(missing_ok=True)
                     result["orphan_files_removed"] += 1
 
-        # 3. GC queue entries whose file is already gone are complete; the
-        #    rest will be handled by the background GC loop.
+        # GC queue entries whose file is already gone are complete; the rest
+        # is handled by the background GC loop. Metadata-only and idempotent,
+        # so an interrupted recovery simply resumes on the next boot.
         with transaction(conn):
             for row in conn.execute(
                     "SELECT g.frag_id AS frag_id, f.rel_path AS rel_path "
@@ -119,7 +141,9 @@ def startup_recovery(cfg: Settings = default_settings) -> dict:
     finally:
         conn.close()
 
-    if any(result.values()):
+    meaningful = {k: v for k, v in result.items()
+                  if k != "reaped_dead_instances" and v}
+    if meaningful:
         log.warning("startup recovery: %s", result)
     return result
 
@@ -136,6 +160,7 @@ def upload_batch(voyage_id: str, csv_text: str,
     except CSVValidationError as exc:
         raise ServiceError(422, str(exc)) from exc
 
+    recovery.ensure_instance(cfg)
     now = datetime.now(timezone.utc)
     now_iso = _iso(now)
     batch_id = str(uuid.uuid4())
@@ -145,41 +170,75 @@ def upload_batch(voyage_id: str, csv_text: str,
     frag_dir.mkdir(parents=True, exist_ok=True)
     rel_path = f"fragments/{voyage_id}/{frag_id}.parquet"
     final_path = _abs_path(rel_path, cfg)
-    tmp_path = _abs_path(f"tmp/upload-{batch_id}.parquet", cfg)
+    tmp_name = f"upload-{batch_id}.parquet"
+    tmp_path = recovery.incarnation_tmp_path(tmp_name, cfg)
+    tmp_rel = f"{recovery.incarnation_tmp_rel(cfg)}/{tmp_name}"
 
-    # Write the immutable fragment first; a crash here leaves only a tmp file
-    # (cleaned on restart) and no metadata, so the client can safely retry.
-    written = write_parquet_atomic(
-        parsed.rows, tmp_path, final_path, cfg.parquet_batch_size)
-    crash_if("upload_commit")
-
+    # Announce the write before touching disk. If this process dies, the
+    # reaper can only reclaim these files after *this* incarnation's lease
+    # expires; a live peer's startup recovery never removes them.
+    intent_id = None
     conn = connect()
     try:
         with transaction(conn):
-            conn.execute(
-                "INSERT INTO voyages(voyage_id, created_at, total_row_count) "
-                "VALUES(?, ?, 0) ON CONFLICT(voyage_id) DO UPDATE SET "
-                "voyage_id=voyage_id", (voyage_id, now_iso))
-            row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM fragments "
-                "WHERE voyage_id=?", (voyage_id,)).fetchone()
-            seq = row["max_seq"] + 1
-            conn.execute(
-                "INSERT INTO fragments(frag_id, voyage_id, kind, rel_path, "
-                "seq, row_count, created_at, status) "
-                "VALUES(?, ?, 'batch', ?, ?, ?, ?, 'active')",
-                (frag_id, voyage_id, rel_path, seq, written, now_iso))
-            conn.execute(
-                "INSERT INTO upload_batches(batch_id, voyage_id, frag_id, "
-                "row_count, received_at) VALUES(?, ?, ?, ?, ?)",
-                (batch_id, voyage_id, frag_id, written, now_iso))
-            conn.execute(
-                "UPDATE voyages SET total_row_count = total_row_count + ? "
-                "WHERE voyage_id=?", (written, voyage_id))
-        # A crash between the rename above and this commit leaves an orphan
-        # file that startup recovery removes; the upload was never acked.
+            intent_id = recovery.register_intent(
+                conn, "upload", tmp_rel, rel_path, cfg)
     finally:
         conn.close()
+
+    try:
+        # Write the immutable fragment first; a crash here leaves only a tmp
+        # file (reclaimed once this incarnation's lease expires) and no
+        # metadata, so the client can safely retry.
+        written = write_parquet_atomic(
+            parsed.rows, tmp_path, final_path, cfg.parquet_batch_size)
+        crash_if("upload_commit")
+        if cfg.upload_sleep_seconds > 0:
+            import time as _time
+            _time.sleep(cfg.upload_sleep_seconds)
+
+        conn = connect()
+        try:
+            with transaction(conn):
+                pub_now = _iso(datetime.now(timezone.utc))
+                # Fence: if a reaper already claimed this intent (lease had
+                # expired while the request was slow), do not register the
+                # reclaimed file.
+                recovery.assert_publish_allowed(conn, intent_id, pub_now)
+                conn.execute(
+                    "INSERT INTO voyages(voyage_id, created_at, total_row_count) "
+                    "VALUES(?, ?, 0) ON CONFLICT(voyage_id) DO UPDATE SET "
+                    "voyage_id=voyage_id", (voyage_id, now_iso))
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM fragments "
+                    "WHERE voyage_id=?", (voyage_id,)).fetchone()
+                seq = row["max_seq"] + 1
+                conn.execute(
+                    "INSERT INTO fragments(frag_id, voyage_id, kind, rel_path, "
+                    "seq, row_count, created_at, status) "
+                    "VALUES(?, ?, 'batch', ?, ?, ?, ?, 'active')",
+                    (frag_id, voyage_id, rel_path, seq, written, now_iso))
+                conn.execute(
+                    "INSERT INTO upload_batches(batch_id, voyage_id, frag_id, "
+                    "row_count, received_at) VALUES(?, ?, ?, ?, ?)",
+                    (batch_id, voyage_id, frag_id, written, now_iso))
+                conn.execute(
+                    "UPDATE voyages SET total_row_count = total_row_count + ? "
+                    "WHERE voyage_id=?", (written, voyage_id))
+                conn.execute(
+                    "UPDATE write_intents SET state='committed' WHERE intent_id=?",
+                    (intent_id,))
+        finally:
+            conn.close()
+    except recovery._LeaseLost:
+        recovery.abort_intent(intent_id, cfg)
+        raise ServiceError(503,
+            "本实例写入租约已失效，临时文件已被回收，请重试该批次上传")
+    except BaseException:
+        # Request-level failure (not a process crash): release the intent and
+        # remove our own files so they need not wait for lease expiry.
+        recovery.abort_intent(intent_id, cfg)
+        raise
 
     return {"batch_id": batch_id, "frag_id": frag_id, "voyage_id": voyage_id,
             "row_count": written, "active_files": active_file_count(voyage_id, cfg)}
@@ -226,8 +285,10 @@ class _Heartbeat(threading.Thread):
 
 def merge_voyage(voyage_id: str, cfg: Settings = default_settings) -> dict:
     validate_voyage_id(voyage_id)
+    recovery.ensure_instance(cfg)
     merge_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
+    incarnation_id = recovery.current_incarnation(cfg)
 
     conn = connect()
     try:
@@ -253,11 +314,16 @@ def merge_voyage(voyage_id: str, cfg: Settings = default_settings) -> dict:
             if len(sources) < 2:
                 raise ServiceError(422,
                     f"航次 {voyage_id} 活动片段数为 {len(sources)}，无需合并")
+            tmp_name = f"merge-{merge_id}.parquet"
+            new_rel = f"merged/{voyage_id}/{merge_id}.parquet"
+            tmp_rel = f"{recovery.incarnation_tmp_rel(cfg)}/{tmp_name}"
+            intent_id = recovery.register_intent(
+                conn, "merge", tmp_rel, new_rel, cfg)
             conn.execute(
                 "INSERT INTO merges(merge_id, voyage_id, state, lease_owner, "
-                "lease_expires, heartbeat_at, created_at) "
-                "VALUES(?, ?, 'writing', ?, ?, ?, ?)",
-                (merge_id, voyage_id, cfg.instance_id,
+                "owner_incarnation, lease_expires, heartbeat_at, created_at) "
+                "VALUES(?, ?, 'writing', ?, ?, ?, ?, ?)",
+                (merge_id, voyage_id, cfg.instance_id, incarnation_id,
                  _lease_expiry(cfg, now), _iso(now), _iso(now)))
             source_ids = [r["frag_id"] for r in sources]
             source_paths = [_abs_path(r["rel_path"], cfg) for r in sources]
@@ -270,7 +336,7 @@ def merge_voyage(voyage_id: str, cfg: Settings = default_settings) -> dict:
     merged_dir.mkdir(parents=True, exist_ok=True)
     new_rel = f"merged/{voyage_id}/{merge_id}.parquet"
     final_path = _abs_path(new_rel, cfg)
-    tmp_path = _abs_path(f"tmp/merge-{merge_id}.parquet", cfg)
+    tmp_path = recovery.incarnation_tmp_path(tmp_name, cfg)
 
     hb = _Heartbeat(merge_id, cfg)
     hb.start()
@@ -302,6 +368,14 @@ def merge_voyage(voyage_id: str, cfg: Settings = default_settings) -> dict:
                     if mine is None or mine["state"] != "writing":
                         raise ServiceError(409,
                             "合并租约已失效（可能被另一实例接管），本次发布取消")
+                    # Fence: our incarnation must still own the write and no
+                    # reaper may have claimed the intent, otherwise we must not
+                    # register the merged file or overwrite newer results.
+                    try:
+                        recovery.assert_publish_allowed(conn, intent_id, now2)
+                    except recovery._LeaseLost:
+                        raise ServiceError(503,
+                            "本实例合并租约已失效，合并产物已被回收，请重新发起合并")
                     # New batches arriving meanwhile get seq beyond the
                     # sources; they must remain active and must not be touched.
                     changed = conn.execute(
@@ -348,6 +422,9 @@ def merge_voyage(voyage_id: str, cfg: Settings = default_settings) -> dict:
                         "UPDATE merges SET state='committed', new_frag_id=?, "
                         "row_count=?, finished_at=? WHERE merge_id=?",
                         (new_frag_id, expected_rows, now2, merge_id))
+                    conn.execute(
+                        "UPDATE write_intents SET state='committed' "
+                        "WHERE intent_id=?", (intent_id,))
                     crash_if("merge_publish")
                 crash_if("merge_after_commit")
             finally:
@@ -357,11 +434,11 @@ def merge_voyage(voyage_id: str, cfg: Settings = default_settings) -> dict:
             # conflicts raised inside the transaction leave the merge row
             # untouched (still 'writing', lease valid or already expired).
             if stream_failed:
-                _fail_merge(merge_id, cfg)
+                _fail_merge(merge_id, cfg, intent_id)
             raise
         except BaseException:
             stream_failed = True
-            _fail_merge(merge_id, cfg)
+            _fail_merge(merge_id, cfg, intent_id)
             raise
     finally:
         hb.stop()
@@ -373,7 +450,8 @@ def merge_voyage(voyage_id: str, cfg: Settings = default_settings) -> dict:
             "active_files": active_file_count(voyage_id, cfg)}
 
 
-def _fail_merge(merge_id: str, cfg: Settings) -> None:
+def _fail_merge(merge_id: str, cfg: Settings,
+                intent_id: str | None = None) -> None:
     try:
         conn = connect()
         try:
@@ -386,8 +464,10 @@ def _fail_merge(merge_id: str, cfg: Settings) -> None:
             conn.close()
     except Exception:
         log.exception("could not mark merge %s failed", merge_id)
-    # Any leftover tmp file / unpublished merged file is reclaimed at startup
-    # (or as an orphan since no fragment row references it).
+    # Release our own write intent and remove local remnants immediately. If
+    # the process itself is dying, the reaper handles them after lease expiry.
+    if intent_id is not None:
+        recovery.abort_intent(intent_id, cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -521,8 +601,15 @@ def list_voyages(cfg: Settings = default_settings) -> List[dict]:
 # --------------------------------------------------------------------------- #
 
 def run_gc_once(cfg: Settings = default_settings) -> dict:
-    """Delete superseded files past their grace time and not pinned."""
+    """Delete superseded files past their grace time and not pinned.
+
+    Also runs the dead-owner remnant reaper so unpublished fragments of a
+    crashed peer are reclaimed without waiting for someone to restart it.
+    Both halves are per-item and idempotent, so an interrupted cycle simply
+    continues on the next tick.
+    """
     result = {"expired_pins": 0, "files_deleted": 0, "bytes_reclaimed": 0}
+    result["reaper"] = recovery.reap_remnants(cfg)
     conn = connect()
     try:
         with transaction(conn):

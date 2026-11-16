@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
-from . import services
+from . import recovery, services
 from .config import settings
 from .db import init_db
 from .services import ServiceError
@@ -28,7 +28,12 @@ async def lifespan(app: FastAPI):
         target=services.gc_loop, name="gc-loop", daemon=True,
         kwargs={"cfg": settings})
     gc_thread.start()
-    yield
+    try:
+        yield
+    finally:
+        # Graceful stop: release the incarnation lease immediately so peers
+        # can reclaim our remnants without waiting for the lease timeout.
+        recovery.shutdown_instance(settings)
 
 
 app = FastAPI(

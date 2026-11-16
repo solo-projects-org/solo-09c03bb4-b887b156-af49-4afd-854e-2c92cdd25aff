@@ -3,6 +3,17 @@
 The database holds *only* metadata. Trajectory rows live in Parquet files.
 WAL mode lets one writer (upload / merge) coexist with readers (export) and
 with the second API instance.
+
+Concurrency / recovery model
+----------------------------
+* ``instances`` is an incarnation registry: every process gets a unique
+  ``incarnation_id`` at startup and renews a lease with a heartbeat. A crashed
+  process stops heartbeating, so its lease expires and every other instance
+  can tell its writes are dead.
+* ``write_intents`` records every in-flight file write (upload or merge)
+  together with its owning incarnation. Remnants are reaped only when the
+  owner is provably dead (registry row dead or lease expired), so one
+  instance starting up never touches another live instance's temp files.
 """
 from __future__ import annotations
 
@@ -52,12 +63,54 @@ CREATE TABLE IF NOT EXISTS upload_batches (
     received_at  TEXT NOT NULL
 );
 
+-- Incarnation registry. One row per process start; the incarnation_id is
+-- unique even when INSTANCE_ID is reused across rolling restarts.
+CREATE TABLE IF NOT EXISTS instances (
+    incarnation_id   TEXT PRIMARY KEY,
+    instance_id      TEXT NOT NULL,
+    started_at       TEXT NOT NULL,
+    last_heartbeat   TEXT NOT NULL,
+    lease_expires    TEXT NOT NULL,
+    -- 'alive' processes renew their lease; 'dead' rows are kept for audit
+    -- and so reaper decisions stay explainable.
+    state            TEXT NOT NULL DEFAULT 'alive'
+                     CHECK (state IN ('alive', 'dead')),
+    tmp_dir_rel      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_instances_lease
+    ON instances(state, lease_expires);
+
+-- Every file that a process is writing (tmp file and its final destination)
+-- is registered here before any byte hits disk. Reapers delete remnants only
+-- for intents whose owning incarnation is dead / lease-expired.
+CREATE TABLE IF NOT EXISTS write_intents (
+    intent_id          TEXT PRIMARY KEY,
+    owner_incarnation  TEXT NOT NULL,
+    -- 'upload' or 'merge'
+    kind               TEXT NOT NULL
+                       CHECK (kind IN ('upload', 'merge')),
+    tmp_rel            TEXT NOT NULL,
+    final_rel          TEXT NOT NULL,
+    state              TEXT NOT NULL DEFAULT 'active'
+                       CHECK (state IN ('active', 'committed',
+                                        'aborted', 'reclaimed')),
+    created_at         TEXT NOT NULL,
+    reclaimed_at       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_intents_owner_state
+    ON write_intents(state, owner_incarnation);
+
 CREATE TABLE IF NOT EXISTS merges (
     merge_id       TEXT PRIMARY KEY,
     voyage_id      TEXT NOT NULL,
     state          TEXT NOT NULL
                    CHECK (state IN ('writing', 'committed', 'failed')),
     lease_owner    TEXT NOT NULL,
+    -- Incarnation that owns the streaming work. NULL only for rows written
+    -- by older builds; startup recovery fails those immediately.
+    owner_incarnation TEXT,
     lease_expires  TEXT NOT NULL,
     heartbeat_at   TEXT NOT NULL,
     new_frag_id    TEXT,
@@ -116,6 +169,10 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def init_db() -> None:
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.fragments_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +182,10 @@ def init_db() -> None:
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.executescript(SCHEMA)
+        # Lightweight migrations for databases created by older builds.
+        if "owner_incarnation" not in _table_columns(conn, "merges"):
+            conn.execute(
+                "ALTER TABLE merges ADD COLUMN owner_incarnation TEXT")
         conn.commit()
     except Exception:
         conn.rollback()
